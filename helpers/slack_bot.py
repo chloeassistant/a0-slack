@@ -148,6 +148,11 @@ class ChatBridgeBot:
         self._auth_failures: dict[str, collections.deque] = {}
         # Ready event for startup synchronization
         self._ready_event: Optional[threading.Event] = None
+        # Recently handled (channel, ts) pairs; Slack may redeliver events
+        self._seen: collections.deque = collections.deque(maxlen=500)
+        # Agent API state
+        self._titled_threads: collections.deque = collections.deque(maxlen=2000)
+        self._native_stream_unsupported = False
 
     def _get_config(self) -> dict:
         """Load the Slack plugin configuration."""
@@ -310,119 +315,203 @@ class ChatBridgeBot:
             logger.error(f"Unhandled error in message handler: {type(e).__name__}: {e}")
 
     async def _handle_message(self, event: dict):
-        """Process an incoming Slack message event."""
-        logger.debug(f"Event received: type={event.get('type')} subtype={event.get('subtype')} "
-                      f"channel={event.get('channel')} user={event.get('user')} "
-                      f"bot_id={event.get('bot_id')}")
+        """Process an app_mention or DM event.
 
-        # Ignore bot messages and message edits/deletions
+        Only users in chat_bridge.allowed_users are served. With
+        chat_bridge.trusted_allowlist, they get the full agent loop without !auth.
+        """
         if event.get("bot_id") or event.get("subtype"):
-            logger.debug("Ignoring: bot message or subtype")
             return
 
         channel_id = event.get("channel", "")
         user_id = event.get("user", "")
         text = event.get("text", "").strip()
-
+        ts = event.get("ts", "")
         if not text or not channel_id or not user_id:
-            logger.debug("Ignoring: missing text/channel/user")
             return
-
-        # Ignore own messages
         if self._bot_info and user_id == self._bot_info.get("user_id"):
-            logger.debug("Ignoring: own message")
             return
 
-        # DMs: handle auth commands only (auth key stays private in DM)
-        is_dm = channel_id.startswith("D")
-        if is_dm:
-            logger.debug(f"DM received from user={user_id}: text starts with '!'={text.startswith('!')} len={len(text)}")
-            if text.startswith("!"):
-                # Apply allowlist to DMs too
-                config = self._get_config()
-                allowed_users = config.get("chat_bridge", {}).get("allowed_users", [])
-                if allowed_users and user_id not in [str(u) for u in allowed_users]:
-                    logger.debug(f"DM blocked by allowlist: user={user_id}")
-                    return
-                logger.info(f"Auth command via DM from user={user_id}: {text.split()[0]}")
-                response = await self._handle_auth_command(text, user_id, channel_id)
-                if response is not None:
-                    # DMs are private — safe to reply normally
-                    await self._send_reply(channel_id, response)
-                else:
-                    logger.debug(f"DM command not recognized: {text[:20]}")
-            else:
-                logger.debug(f"DM ignored (not a command): {text[:30]}")
-            return  # Don't process non-command DMs
-
-        chat_channels = get_chat_channels()
-        if channel_id not in chat_channels:
-            logger.debug(f"Ignoring: channel {channel_id} not in bridge channels {list(chat_channels.keys())}")
+        seen_key = f"{channel_id}:{ts}"
+        if seen_key in self._seen:
             return
+        self._seen.append(seen_key)
 
-        logger.info(f"Processing message from user={user_id} in channel={channel_id}: {text[:50]}...")
-
-        # User allowlist
         config = self._get_config()
-        allowed_users = config.get("chat_bridge", {}).get("allowed_users", [])
-        if allowed_users and user_id not in [str(u) for u in allowed_users]:
+        bridge = config.get("chat_bridge", {})
+        allowed = [str(u) for u in bridge.get("allowed_users", [])]
+        if allowed and user_id not in allowed:
+            logger.info(f"Ignoring user={user_id} (not in allowlist) in channel={channel_id}")
             return
 
-        # Handle auth commands in channels
+        is_dm = event.get("channel_type") == "im" or channel_id.startswith("D")
+        bot_uid = (self._bot_info or {}).get("user_id")
+        if bot_uid:
+            text = text.replace(f"<@{bot_uid}>", "").strip()
+        if not text:
+            return
+
+        # Threads: reply in the thread. Channel root message: open a thread.
+        # DM root message: reply inline.
+        root_ts = event.get("thread_ts") or ("" if is_dm else ts)
+        session_key = f"{channel_id}:{root_ts}" if root_ts else channel_id
+
         if text.startswith("!"):
-            if text.lower().startswith("!auth "):
-                # !auth in a channel — redirect to DM for security
-                await self._delete_auth_message(channel_id, event.get("ts", ""), user_id)
+            if text.lower().startswith("!auth ") and not is_dm:
+                await self._delete_auth_message(channel_id, ts, user_id)
                 await self._send_ephemeral(
                     channel_id, user_id,
-                    ":lock: For security, please send `!auth <key>` as a *direct message* to me instead.\n"
-                    "Your elevation will apply to all bridge channels."
+                    ":lock: For security, please send `!auth <key>` as a *direct message* to me instead.",
                 )
                 return
-            # Other commands (!deauth, !status) — OK in channel, respond ephemerally
             response = await self._handle_auth_command(text, user_id, channel_id)
             if response is not None:
-                await self._send_ephemeral(channel_id, user_id, response)
+                if is_dm:
+                    await self._send_reply(channel_id, response, thread_ts=root_ts)
+                else:
+                    await self._send_ephemeral(channel_id, user_id, response)
                 return
 
-        # Content length check
         if len(text) > self.MAX_CHAT_MESSAGE_LENGTH:
             await self._send_reply(
                 channel_id,
                 f"Message too long ({len(text)} chars). Max: {self.MAX_CHAT_MESSAGE_LENGTH}.",
-                thread_ts=event.get("ts"),
+                thread_ts=root_ts,
             )
             return
 
-        # Rate limiting
         now = time.monotonic()
-        if user_id not in self._rate_limits:
-            self._rate_limits[user_id] = collections.deque()
-        timestamps = self._rate_limits[user_id]
+        timestamps = self._rate_limits.setdefault(user_id, collections.deque())
         while timestamps and now - timestamps[0] > self.RATE_LIMIT_WINDOW:
             timestamps.popleft()
         if len(timestamps) >= self.RATE_LIMIT_MAX:
             await self._send_reply(
                 channel_id,
                 f"Rate limit: max {self.RATE_LIMIT_MAX} messages per {self.RATE_LIMIT_WINDOW}s.",
-                thread_ts=event.get("ts"),
+                thread_ts=root_ts,
             )
             return
         timestamps.append(now)
 
-        # Route based on elevation
-        is_elevated = self._is_elevated(user_id)
+        skills = bridge.get("channel_skill_bindings", {}).get(channel_id) or []
+        if skills:
+            text = (
+                f"(Este canal tem skills vinculadas: {', '.join(skills)}. "
+                f"Carregue-as com skills_tool antes de responder.)\n{text}"
+            )
 
+        trusted = bool(bridge.get("trusted_allowlist")) and bool(allowed)
+        is_elevated = trusted or self._is_elevated(user_id)
+        logger.info(
+            f"Processing user={user_id} channel={channel_id} dm={is_dm} "
+            f"session={session_key} elevated={is_elevated}"
+        )
+
+        # Agent API: the status line and title only exist inside a thread.
+        status_thread = root_ts or None
+        if is_dm and event.get("thread_ts"):
+            await self._set_thread_title(channel_id, event["thread_ts"], text)
+
+        await self._set_status_reaction(channel_id, ts, add=True)
+        if status_thread:
+            await self._set_thread_status(channel_id, status_thread, "está pensando...")
         try:
             if is_elevated:
-                response_text = await self._get_elevated_response(channel_id, text, user_id)
+                response_text = await self._get_elevated_response(
+                    session_key, text, user_id,
+                    where="DM" if is_dm else f"<#{channel_id}>",
+                    status_thread=(channel_id, status_thread) if status_thread else None,
+                )
             else:
-                response_text = await self._get_agent_response(channel_id, text, user_id)
+                response_text = await self._get_agent_response(session_key, text, user_id)
         except Exception as e:
-            logger.error(f"Agent error: {type(e).__name__}")
-            response_text = "An error occurred while processing your message."
+            logger.error(f"Agent error: {type(e).__name__}: {e}")
+            response_text = "Tive um erro ao processar essa mensagem."
+        finally:
+            await self._set_status_reaction(channel_id, ts, add=False)
 
-        await self._send_reply(channel_id, response_text, thread_ts=event.get("ts"))
+        await self._send_reply(
+            channel_id, response_text, thread_ts=root_ts, recipient_user_id=user_id,
+            recipient_team_id=event.get("team") or (self._bot_info or {}).get("team_id", ""),
+        )
+        if status_thread:
+            await self._set_thread_status(channel_id, status_thread, "")
+
+    async def _set_thread_status(self, channel_id: str, thread_ts: str, status: str):
+        """assistant.threads.setStatus; empty status clears. Best effort."""
+        if not thread_ts or not self._web_client:
+            return
+        try:
+            await self._web_client.assistant_threads_setStatus(
+                channel_id=channel_id, thread_ts=thread_ts, status=status[:100]
+            )
+        except Exception as e:
+            logger.debug(f"setStatus failed: {type(e).__name__}: {e}")
+
+    async def _set_thread_title(self, channel_id: str, thread_ts: str, text: str):
+        """Title an agent DM thread once, from its first message. Best effort."""
+        key = f"{channel_id}:{thread_ts}"
+        if not self._web_client or key in self._titled_threads:
+            return
+        title = " ".join(text.split())
+        if not title or title.startswith(("/", "!")):
+            return
+        if len(title) > 80:
+            title = title[:77].rstrip() + "..."
+        self._titled_threads.append(key)
+        method = getattr(self._web_client, "agents_sessions_rename", None)
+        try:
+            if method is None:
+                raise AttributeError("agents_sessions_rename")
+            await method(channel_id=channel_id, thread_ts=thread_ts, title=title)
+            return
+        except Exception as e:
+            logger.debug(f"agents.sessions.rename failed ({type(e).__name__}); trying setTitle")
+        try:
+            await self._web_client.assistant_threads_setTitle(
+                channel_id=channel_id, thread_ts=thread_ts, title=title
+            )
+        except Exception as e:
+            logger.debug(f"setTitle failed: {type(e).__name__}: {e}")
+
+    async def _status_poller(self, context, channel_id: str, thread_ts: str, done: asyncio.Event):
+        """Mirror the agent's latest log heading into the Slack status line."""
+        last = ""
+        while not done.is_set():
+            try:
+                logs = context.log.logs
+                heading = ""
+                for item in reversed(logs[-10:]):
+                    if item.heading and item.type != "user":
+                        heading = item.heading
+                        break
+                heading = " ".join(heading.replace("icon://", "").split())
+                # drop a leading material icon token like "construction "
+                parts = heading.split(" ", 1)
+                if len(parts) == 2 and parts[0].islower() and "_" in parts[0] or (
+                    len(parts) == 2 and parts[0].isalpha() and parts[0].islower() and parts[0].isascii()
+                    and parts[1][:1].isupper()
+                ):
+                    heading = parts[1]
+                if heading and heading != last:
+                    last = heading
+                    await self._set_thread_status(channel_id, thread_ts, heading)
+            except Exception as e:
+                logger.debug(f"status poller: {type(e).__name__}: {e}")
+            try:
+                await asyncio.wait_for(done.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _set_status_reaction(self, channel_id: str, ts: str, add: bool):
+        """Show :eyes: on the triggering message while working (best effort)."""
+        if not ts or not self._web_client:
+            return
+        try:
+            method = self._web_client.reactions_add if add else self._web_client.reactions_remove
+            await method(channel=channel_id, timestamp=ts, name="eyes")
+        except Exception as e:
+            logger.debug(f"Status reaction failed: {type(e).__name__}")
 
     # ------------------------------------------------------------------
     # Restricted mode
@@ -496,7 +585,7 @@ class ChatBridgeBot:
     # Elevated mode
     # ------------------------------------------------------------------
 
-    async def _get_elevated_response(self, channel_id: str, text: str, user_id: str) -> str:
+    async def _get_elevated_response(self, channel_id: str, text: str, user_id: str, where: str = "", status_thread: Optional[tuple] = None) -> str:
         """Route through the full Agent Zero agent loop."""
         try:
             from agent import AgentContext, AgentContextType, UserMessage
@@ -526,13 +615,29 @@ class ChatBridgeBot:
                 pass
 
             prefixed_text = (
-                f"[Slack Chat Bridge - authenticated message from {author_name}]\n"
+                f"[Slack {where or 'chat'}: mensagem de {author_name} ({user_id}), "
+                f"verificado pela allowlist do bridge. A resposta final vai para o Slack "
+                f"e é renderizada como markdown.]\n"
                 f"{safe_text}"
             )
 
             user_msg = UserMessage(message=prefixed_text, attachments=[])
             task = context.communicate(user_msg)
-            result = await task.result()
+            done = asyncio.Event()
+            poller = None
+            if status_thread:
+                poller = asyncio.create_task(
+                    self._status_poller(context, status_thread[0], status_thread[1], done)
+                )
+            try:
+                result = await task.result()
+            finally:
+                done.set()
+                if poller:
+                    try:
+                        await poller
+                    except Exception:
+                        pass
             return result if isinstance(result, str) else str(result)
 
         except ImportError:
@@ -589,19 +694,85 @@ class ChatBridgeBot:
     # Response sending
     # ------------------------------------------------------------------
 
-    async def _send_reply(self, channel_id: str, text: str, thread_ts: str = ""):
-        """Send a response to Slack, splitting long messages."""
+    _STREAM_UNSUPPORTED_MARKERS = (
+        "not_allowed", "missing_scope", "feature_not_enabled", "invalid_method",
+        "unknown_method", "method_deprecated", "not_authed", "streaming_not_allowed",
+    )
+
+    async def _send_reply(
+        self, channel_id: str, text: str, thread_ts: str = "",
+        recipient_user_id: str = "", recipient_team_id: str = "",
+    ):
+        """Send a reply. In threads, use Slack's native agent stream
+        (chat.startStream/appendStream/stopStream); otherwise, or if the app
+        lacks the Agents & AI Apps feature, post markdown blocks."""
         if not text:
             text = "(No response)"
-        chunks = _split_message(text)
+        chunks = _split_message(text, 11000)
+        if thread_ts and not self._native_stream_unsupported:
+            if await self._send_stream(
+                channel_id, chunks, thread_ts, recipient_user_id, recipient_team_id
+            ):
+                return
         for chunk in chunks:
-            kwargs = {"channel": channel_id, "text": chunk}
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
+            await self._post_markdown(channel_id, chunk, thread_ts)
+
+    async def _send_stream(
+        self, channel_id: str, chunks: list, thread_ts: str,
+        recipient_user_id: str, recipient_team_id: str,
+    ) -> bool:
+        start_kwargs = {"channel": channel_id, "thread_ts": thread_ts, "markdown_text": chunks[0]}
+        if recipient_user_id:
+            start_kwargs["recipient_user_id"] = recipient_user_id
+        if recipient_team_id:
+            start_kwargs["recipient_team_id"] = recipient_team_id
+        try:
+            resp = await self._web_client.chat_startStream(**start_kwargs)
+            ts = resp.get("ts") if resp else None
+            if not ts:
+                raise RuntimeError("chat.startStream returned no ts")
+        except Exception as e:
+            err = str(e)
+            if any(m in err for m in self._STREAM_UNSUPPORTED_MARKERS):
+                self._native_stream_unsupported = True
+                logger.warning(f"Native streaming unavailable ({err[:120]}); using markdown blocks")
+            else:
+                logger.warning(f"chat.startStream failed ({type(e).__name__}: {err[:120]})")
+            return False
+        sent = 1
+        try:
+            for chunk in chunks[1:]:
+                await self._web_client.chat_appendStream(channel=channel_id, ts=ts, markdown_text=chunk)
+                sent += 1
+        except Exception as e:
+            logger.warning(f"chat.appendStream failed ({type(e).__name__}); posting the rest")
+        try:
+            await self._web_client.chat_stopStream(channel=channel_id, ts=ts)
+        except Exception as e:
+            logger.debug(f"chat.stopStream failed: {type(e).__name__}: {e}")
+        for chunk in chunks[sent:]:
+            await self._post_markdown(channel_id, chunk, thread_ts)
+        return True
+
+    async def _post_markdown(self, channel_id: str, chunk: str, thread_ts: str = ""):
+        kwargs = {
+            "channel": channel_id,
+            "text": chunk,
+            "blocks": [{"type": "markdown", "text": chunk}],
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        try:
+            await self._web_client.chat_postMessage(**kwargs)
+        except Exception as e:
+            logger.warning(f"Markdown block send failed ({type(e).__name__}: {e}); sending plain text")
+            kwargs.pop("blocks")
             try:
                 await self._web_client.chat_postMessage(**kwargs)
-            except Exception as e:
-                logger.error(f"Failed to send message: {type(e).__name__}")
+            except Exception as e2:
+                logger.error(f"Failed to send message: {type(e2).__name__}")
 
     # ------------------------------------------------------------------
     # Bot lifecycle
@@ -645,7 +816,10 @@ class ChatBridgeBot:
 
             if req.type == "events_api":
                 event = req.payload.get("event", {})
-                if event.get("type") == "message":
+                etype = event.get("type")
+                if etype == "app_mention" or (
+                    etype == "message" and event.get("channel_type") == "im"
+                ):
                     # Process in a background task so one slow LLM call
                     # doesn't block subsequent Slack events
                     asyncio.create_task(bot._safe_handle_message(event))

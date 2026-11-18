@@ -31,13 +31,10 @@ async def execute(agent, **kwargs):
         if not bridge_config.get("auto_start", False):
             return  # Auto-start disabled
 
-        from usr.plugins.slack.helpers.slack_bot import get_chat_channels, start_chat_bridge
+        from usr.plugins.slack.helpers.slack_bot import start_chat_bridge
 
-        channels = get_chat_channels()
-        if not channels:
-            return  # No channels configured
-
-        logger.info(f"Auto-starting Slack chat bridge ({len(channels)} channel(s))...")
+        # The bridge answers @mentions in any channel and DMs; no channel list needed.
+        logger.info("Auto-starting Slack chat bridge...")
         await start_chat_bridge(bot_token, app_token)
         logger.info("Slack chat bridge auto-started successfully.")
 
