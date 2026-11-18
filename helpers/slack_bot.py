@@ -351,9 +351,9 @@ class ChatBridgeBot:
         if not text:
             return
 
-        # Threads: reply in the thread. Channel root message: open a thread.
-        # DM root message: reply inline.
-        root_ts = event.get("thread_ts") or ("" if is_dm else ts)
+        # Always reply in a thread: existing thread, or open one on the root
+        # message (channels and DMs alike).
+        root_ts = event.get("thread_ts") or ts
         session_key = f"{channel_id}:{root_ts}" if root_ts else channel_id
 
         if text.startswith("!"):
