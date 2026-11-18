@@ -436,6 +436,14 @@ class ChatBridgeBot:
         )
         if status_thread:
             await self._set_thread_status(channel_id, status_thread, "")
+        # Done marker, same as Hermes: :eyes: removed above, :white_check_mark: added.
+        if ts and self._web_client:
+            try:
+                await self._web_client.reactions_add(
+                    channel=channel_id, timestamp=ts, name="white_check_mark"
+                )
+            except Exception as e:
+                logger.debug(f"Done reaction failed: {type(e).__name__}")
 
     async def _set_thread_status(self, channel_id: str, thread_ts: str, status: str):
         """assistant.threads.setStatus; empty status clears. Best effort."""
