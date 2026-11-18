@@ -405,6 +405,16 @@ class ChatBridgeBot:
             st.setdefault("watermarks", {})[session_key] = ts
             save_chat_state(st)
 
+        # Hermes parity: the first turn in a thread also gets the thread root's
+        # images; the triggering message's own images always go along.
+        image_files = list(event.get("files") or [])
+        if thread_context and "[thread parent]" in thread_context:
+            parent = next((m for m in getattr(self, "_last_replies", []) or []
+                           if m.get("ts") == event.get("thread_ts")), None)
+            if parent:
+                image_files = list(parent.get("files") or []) + image_files
+        attachments = await self._download_images(image_files)
+
         skills = bridge.get("channel_skill_bindings", {}).get(channel_id) or []
         if skills:
             text = (
@@ -434,6 +444,7 @@ class ChatBridgeBot:
                     where="DM" if is_dm else f"<#{channel_id}>",
                     status_thread=(channel_id, status_thread) if status_thread else None,
                     thread_context=thread_context,
+                    attachments=attachments,
                 )
             else:
                 response_text = await self._get_agent_response(session_key, thread_context + text, user_id)
@@ -487,6 +498,7 @@ class ChatBridgeBot:
         try:
             resp = await self._web_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
             msgs = resp.get("messages", []) or []
+            self._last_replies = msgs
         except Exception as e:
             logger.warning(f"conversations.replies failed: {type(e).__name__}: {e}")
             return ""
@@ -544,6 +556,57 @@ class ChatBridgeBot:
         if len(body) > max_chars:
             body = body[-max_chars:]
         return header + "\n" + body + "\n[End of thread context]\n\n"
+
+    def _ensure_project(self, context):
+        """Put bridge chats in the configured A0 project (default "Slack")."""
+        try:
+            from helpers import projects
+            name = self._get_config().get("chat_bridge", {}).get("project", "Slack")
+            if not name or projects.get_context_project_name(context) == name:
+                return
+            if name in [p.get("name") for p in projects.get_active_projects_list()]:
+                projects.activate_project(context.id, name, mark_dirty=False)
+        except Exception as e:
+            logger.warning(f"Could not set project: {type(e).__name__}: {e}")
+
+    MAX_IMAGES = 5
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+    async def _download_images(self, files_meta: list) -> list:
+        """Download Slack image files (files:read) to usr/uploads/slack. Best effort."""
+        out = []
+        imgs = [f for f in files_meta if str(f.get("mimetype", "")).startswith("image/")
+                and (f.get("url_private_download") or f.get("url_private"))]
+        if not imgs:
+            return out
+        import aiohttp, re as _re
+        dest = Path("/a0/usr/uploads/slack"); dest.mkdir(parents=True, exist_ok=True)
+        headers = {"Authorization": f"Bearer {self.bot_token}"}
+        try:
+            async with aiohttp.ClientSession() as s:
+                for f in imgs[: self.MAX_IMAGES]:
+                    if (f.get("size") or 0) > self.MAX_IMAGE_BYTES:
+                        continue
+                    url = f.get("url_private_download") or f.get("url_private")
+                    name = _re.sub(r"[^A-Za-z0-9._-]", "_", f.get("name") or "image")[:80]
+                    path = dest / f"{f.get('id', 'F')}_{name}"
+                    try:
+                        if not path.exists():
+                            async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                                ctype = r.headers.get("Content-Type", "")
+                                if r.status != 200 or not ctype.startswith("image/"):
+                                    logger.warning(f"Image download failed: {r.status} {ctype}")
+                                    continue
+                                data = await r.read()
+                                if len(data) > self.MAX_IMAGE_BYTES:
+                                    continue
+                                path.write_bytes(data)
+                        out.append(str(path))
+                    except Exception as e:
+                        logger.warning(f"Image download error: {type(e).__name__}: {e}")
+        except Exception as e:
+            logger.warning(f"Image session error: {type(e).__name__}: {e}")
+        return out
 
     async def _set_thread_status(self, channel_id: str, thread_ts: str, status: str):
         """assistant.threads.setStatus; empty status clears. Best effort."""
@@ -642,6 +705,7 @@ class ChatBridgeBot:
                 set_context_id(channel_id, context.id)
                 logger.info(f"Created new context {context.id} for channel {channel_id}")
 
+            self._ensure_project(context)
             agent = context.agent0
 
             from usr.plugins.slack.helpers.sanitize import sanitize_content, sanitize_username
@@ -693,7 +757,7 @@ class ChatBridgeBot:
     # Elevated mode
     # ------------------------------------------------------------------
 
-    async def _get_elevated_response(self, channel_id: str, text: str, user_id: str, where: str = "", status_thread: Optional[tuple] = None, thread_context: str = "") -> str:
+    async def _get_elevated_response(self, channel_id: str, text: str, user_id: str, where: str = "", status_thread: Optional[tuple] = None, thread_context: str = "", attachments: Optional[list] = None) -> str:
         """Route through the full Agent Zero agent loop."""
         try:
             from agent import AgentContext, AgentContextType, UserMessage
@@ -709,6 +773,7 @@ class ChatBridgeBot:
                 set_context_id(channel_id, context.id)
                 logger.info(f"Created new elevated context {context.id} for channel {channel_id}")
 
+            self._ensure_project(context)
             from usr.plugins.slack.helpers.sanitize import sanitize_content, sanitize_username
             safe_text = sanitize_content(text)
 
@@ -734,8 +799,8 @@ class ChatBridgeBot:
             msg_id = str(uuid.uuid4())
             # Show the Slack message in the WebUI chat, as api_message does.
             context.log.log(type="user", heading="", content=f"[Slack] {author_name}: {text}",
-                            kvps={}, id=msg_id)
-            user_msg = UserMessage(message=prefixed_text, attachments=[], id=msg_id)
+                            kvps={"attachments": [os.path.basename(a) for a in (attachments or [])]}, id=msg_id)
+            user_msg = UserMessage(message=prefixed_text, attachments=list(attachments or []), id=msg_id)
             task = context.communicate(user_msg)
             done = asyncio.Event()
             poller = None
