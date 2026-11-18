@@ -398,6 +398,12 @@ class ChatBridgeBot:
             thread_context = await self._hydrate_thread_context(
                 channel_id, event["thread_ts"], ts, session_key, allowed
             )
+        else:
+            # Root turn opens the thread: start the watermark here so the next
+            # mention only receives what was said after it.
+            st = load_chat_state()
+            st.setdefault("watermarks", {})[session_key] = ts
+            save_chat_state(st)
 
         skills = bridge.get("channel_skill_bindings", {}).get(channel_id) or []
         if skills:
@@ -461,9 +467,9 @@ class ChatBridgeBot:
         marks = state.setdefault("watermarks", {})
         has_session = bool(get_context_id(session_key))
         after = marks.get(session_key, "") if has_session else ""
-        ctx = ""
-        if not has_session or after:
-            ctx = await self._thread_context(channel_id, thread_ts, ts, after_ts=after, allowed=allowed)
+        # Every event we get is addressed to us (mention/DM): always fetch the delta.
+        # An empty watermark means the whole thread.
+        ctx = await self._thread_context(channel_id, thread_ts, ts, after_ts=after, allowed=allowed)
         marks[session_key] = ts
         if len(marks) > 5000:
             for k in sorted(marks, key=lambda k: marks[k])[: len(marks) - 5000]:
